@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Sample subtitles are third-party/copyrighted; kept local only.
+samples/
+
+# Generated subtitle output
+*.gloss.srt
+*.gloss.ass
