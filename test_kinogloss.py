@@ -133,6 +133,63 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(merged[0].gloss, "Where is the train station?")
 
 
+class FragmentFillTests(unittest.TestCase):
+    def test_ends_sentence_heuristics(self):
+        ends = kinogloss._ends_sentence
+        self.assertTrue(ends("Wo ist der Bahnhof?"))
+        self.assertTrue(ends("[Musik]"))
+        self.assertTrue(ends('"Genau."'))
+        self.assertTrue(ends("Ende.</i>"))
+        self.assertFalse(ends("Ich habe gestern"))
+        self.assertFalse(ends("Warte mal..."))
+        self.assertFalse(ends("Warte mal…"))
+
+    def test_starts_mid_sentence_heuristics(self):
+        starts = kinogloss._starts_mid_sentence
+        self.assertTrue(starts("den ganzen Tag"))
+        self.assertTrue(starts("...und dann?"))
+        self.assertFalse(starts("Hallo!"))
+        self.assertFalse(starts("- Nein."))
+        self.assertFalse(starts("<i>Ja.</i>"))
+
+    def test_middle_fragment_borrows_overlapping_gloss(self):
+        # One sentence: three cues in the reference, two in the gloss file.
+        # The middle reference cue overlaps no gloss cue best, but borrows
+        # both that cover it.
+        ref = [
+            Cue(0, 2000, "Ich habe gestern"),
+            Cue(2000, 4000, "den ganzen Tag"),
+            Cue(4000, 6000, "gearbeitet."),
+        ]
+        other = [
+            Cue(0, 3000, "Yesterday I worked"),
+            Cue(3000, 6000, "the whole day."),
+        ]
+        merged, stats = merge(ref, other, True, 0.3)
+        self.assertEqual(stats["matched"], 2)
+        self.assertEqual(stats["filled"], 1)
+        self.assertEqual(stats["unmatched"], 0)
+        self.assertEqual(merged[1].gloss, "Yesterday I worked the whole day.")
+
+    def test_standalone_cue_is_not_filled(self):
+        # The interjection is a complete utterance the gloss file skipped;
+        # it overlaps the long gloss cue but must not borrow its text.
+        ref = [Cue(0, 2000, "Hallo."), Cue(2050, 2500, "Hm.")]
+        other = [Cue(0, 2500, "Hello.")]
+        merged, stats = merge(ref, other, True, 0.3)
+        self.assertEqual(stats["filled"], 0)
+        self.assertEqual(stats["unmatched"], 1)
+        self.assertEqual(merged[1].gloss, "")
+
+    def test_fill_requires_time_overlap(self):
+        # A fragment with no gloss cue anywhere near it stays bare.
+        ref = [Cue(0, 2000, "Ich habe gestern"), Cue(50_000, 52_000, "gearbeitet.")]
+        other = [Cue(0, 2000, "Yesterday I worked")]
+        merged, stats = merge(ref, other, True, 0.3)
+        self.assertEqual(stats["filled"], 0)
+        self.assertEqual(merged[1].gloss, "")
+
+
 class RenderTests(unittest.TestCase):
     MERGED = [
         MergedCue(1000, 3000, "Wo ist der Bahnhof?", "Where is the train station?"),
@@ -175,6 +232,38 @@ class RenderTests(unittest.TestCase):
             "Dialogue: 0,0:00:01.00,0:00:03.00,Gloss,,0,0,0,,Where is the train station?",
             out,
         )
+
+    FILLED = [
+        MergedCue(0, 2000, "Ich habe gestern", "Yesterday I worked the whole day."),
+        MergedCue(2100, 4000, "den ganzen Tag", "Yesterday I worked the whole day."),
+        MergedCue(4100, 6000, "gearbeitet.", "Yesterday I worked the whole day."),
+    ]
+
+    def test_ass_top_merges_duplicate_glosses_into_spanning_event(self):
+        out = render_ass(self.FILLED, gloss_position="top")
+        self.assertEqual(out.count("Dialogue:"), 4)  # 3 main + 1 gloss span
+        self.assertIn("Dialogue: 0,0:00:00.00,0:00:06.00,Gloss,", out)
+
+    def test_srt_top_merges_duplicate_glosses_into_spanning_cue(self):
+        out = render_srt(self.FILLED, gloss_position="top")
+        self.assertEqual(out.count("{\\an8}"), 1)
+        self.assertIn(
+            "00:00:00,000 --> 00:00:06,000\n"
+            "{\\an8}<i>Yesterday I worked the whole day.</i>",
+            out,
+        )
+
+    def test_below_mode_keeps_duplicate_glosses_per_cue(self):
+        out = render_ass(self.FILLED)
+        self.assertEqual(out.count("Yesterday I worked"), 3)
+
+    def test_distant_repeats_are_not_merged(self):
+        merged = [
+            MergedCue(0, 2000, "Вау.", "Wow."),
+            MergedCue(30_000, 32_000, "Вау.", "Wow."),
+        ]
+        out = render_ass(merged, gloss_position="top")
+        self.assertEqual(out.count(",Gloss,"), 2)
 
     def test_ass_escapes_braces_and_newlines(self):
         merged = [MergedCue(0, 1000, "Zeile eins\nZeile {zwei}", "")]
@@ -338,6 +427,69 @@ class DriftCorrectionTests(unittest.TestCase):
                 kinogloss.main([str(de), str(en), "-o", str(Path(tmp) / "out.srt")])
             self.assertNotIn("drift correction", stderr.getvalue())
             self.assertIn("offset applied", stderr.getvalue())
+
+
+class JumpCorrectionTests(unittest.TestCase):
+    JUMPS = ((0, -1800), (60, 1500), (200, 3800))  # (first cue index, offset)
+
+    @classmethod
+    def _jumpy_pair(cls, n=300):
+        """Reference shifted by a different constant in each stretch, as with
+        releases whose commercial breaks sit at different points."""
+        ref, other = [], []
+        t = 5000
+        for i in range(n):
+            offset = next(off for lo, off in reversed(cls.JUMPS) if i >= lo)
+            dur = 1500 + (i * 911) % 2000
+            other.append(Cue(t, t + dur, f"Sentence {i}"))
+            ref.append(Cue(t + offset, t + dur + offset, f"Satz {i}"))
+            t += dur + 800 + (i * 2617) % 6000
+        return ref, other
+
+    def test_estimate_piecewise_recovers_segments(self):
+        ref, other = self._jumpy_pair()
+        segments = kinogloss.estimate_piecewise_offsets(ref, other)
+        self.assertIsNotNone(segments)
+        self.assertEqual(len(segments), len(self.JUMPS))
+        for (seg_lo, seg_hi, seg_offset), (true_lo, true_offset) in zip(
+            segments, self.JUMPS
+        ):
+            self.assertLessEqual(abs(seg_lo - true_lo), 2)
+            self.assertLessEqual(abs(seg_offset - true_offset), 150)
+        self.assertEqual(segments[-1][1], len(other))
+
+    def test_constant_offset_yields_no_segments(self):
+        ref, other = self._jumpy_pair()
+        shifted = shift_cues(other, 2500)
+        self.assertIsNone(kinogloss.estimate_piecewise_offsets(other, shifted))
+
+    def test_cli_corrects_jumps_and_pairs_correctly(self):
+        import contextlib
+        import io
+
+        ref, other = self._jumpy_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            de = Path(tmp) / "de.srt"
+            en = Path(tmp) / "en.srt"
+            de.write_text(kinogloss.write_srt(ref), encoding="utf-8")
+            en.write_text(kinogloss.write_srt(other), encoding="utf-8")
+            out = Path(tmp) / "out.srt"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = kinogloss.main([str(de), str(en), "-o", str(out)])
+            self.assertEqual(code, 0)
+            self.assertIn("sync-jump correction applied", stderr.getvalue())
+
+            merged = parse_srt(out.read_text(encoding="utf-8"))
+            glossed = mispaired = 0
+            for cue in merged:
+                m = re.match(r"Satz (\d+)\n<i>Sentence (\d+)</i>", cue.text)
+                if m:
+                    glossed += 1
+                    if m.group(1) != m.group(2):
+                        mispaired += 1
+            self.assertEqual(mispaired, 0)
+            self.assertGreater(glossed / len(merged), 0.95)
 
 
 class CliTests(unittest.TestCase):

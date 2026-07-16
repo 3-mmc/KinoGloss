@@ -55,8 +55,11 @@ python3 kinogloss.py film.de.srt film.en.srt --timestamps 2 -o film.bilingual.sr
 Every plausible pairing between a cue in one file and a cue in the other
 proposes a time delta. The true offset appears as a dense cluster of
 near-identical deltas; the densest candidate clusters are then verified by
-shifting the cues and counting actual overlaps. The winning offset is applied
-to the non-timestamp file before cues are matched by overlap.
+shifting the cues and measuring how much of their duration actually lands on
+a cue in the other file (in back-to-back dialogue nearly every offset
+overlaps *something*, so overlap duration decides, not overlap count). The
+winning offset is applied to the non-timestamp file before cues are matched
+by overlap.
 
 ## Styling and layout
 
@@ -79,6 +82,11 @@ proper style; in SRT it emits the gloss as a second simultaneous cue tagged
 `{\an8}`, which VLC, mpv, and Kodi honor (players that don't will show it as
 a normal extra cue at the bottom).
 
+In top position, consecutive cues that would show the same gloss (see
+fragment borrowing below) render as one event spanning them all: the
+translation stays quietly on screen while the main cues change, instead of
+re-rendering per cue. Repeats more than a second apart stay separate events.
+
 ## Sync verification
 
 Every run ends with a sync verdict judged over the whole runtime, based on
@@ -94,8 +102,8 @@ The check distinguishes the ways two releases go out of sync:
   residuals grow steadily; reported with the drift rate — and corrected
   automatically, see below.
 - **Sync jump**: residuals step at one point, e.g. one release contains a
-  recap or an extra scene. Reported with the size and location of the jump;
-  not corrected automatically.
+  recap or an extra scene. Reported with the size and location of the jump —
+  and corrected automatically, see below.
 - **Unmatched stretch**: a span where no cues pair at all — the releases
   differ structurally there.
 - **Poor match rate**: when fewer than 60% of cues find a partner, residual
@@ -116,8 +124,26 @@ is named:
 drift correction applied to non-timestamp file: rate ×0.959038 (-2458 ms/min, ≈ 23.976 → 25 fps), offset -10.77 s
 ```
 
-Manual `--offset` disables automatic correction. Sync jumps (an extra scene
-in one release) are diagnosed but not corrected.
+## Sync-jump correction
+
+TV releases often differ in where their commercial breaks or recaps sit, so
+the right offset is a *different* constant in each stretch of the episode —
+neither one offset nor a linear map fits. KinoGloss detects this by
+estimating local offsets in windows across the runtime; the distinct offsets
+found become candidates, and each cue is assigned the candidate that
+maximizes its overlap with the other file (with a penalty per switch, so the
+assignment stays piecewise instead of flickering). As with drift, the
+correction is kept only if it pairs more cues than the constant offset did:
+
+```
+sync-jump correction applied to non-timestamp file, 3 segments:
+  00:00:00–00:01:10  -164 ms  (28 cues)
+  00:01:18–00:08:25  +1569 ms  (198 cues)
+  00:08:29–00:20:54  +3785 ms  (295 cues)
+```
+
+Manual `--offset` disables all automatic correction. Jumps smaller than
+about 0.6 s are treated as ordinary timing noise.
 
 `--check` prints the evidence behind the verdict — a table of median
 residuals per 10-minute segment:
@@ -128,6 +154,22 @@ segment      median residual   matched pairs
 00:10–00:20            -5 ms              82
 ...
 ```
+
+## When cue segmentation differs
+
+The two files rarely split sentences into cues the same way. Where the
+non-timestamp file is split finer, all its cues covering one timestamp-file
+cue are joined with spaces. The opposite direction — one sentence spread
+over *more* cues in the timestamp file — would leave the middle fragments
+with no gloss, since each gloss cue attaches only to the cue it overlaps
+most. Fragments like that borrow the gloss of every cue that overlaps them,
+so the full translation stays visible (duplicated across the fragments
+rather than misleadingly cut apart). Punctuation decides what counts as a
+fragment: a cue that doesn't end a sentence, starts lowercase, ends in an
+ellipsis, or follows an unfinished cue. Complete utterances the other file
+simply skipped (interjections, sound descriptions) are left bare on purpose.
+With `--gloss-position top`, the duplicated translation is shown as a single
+event spanning the fragments instead of repeating.
 
 Cues that exist in only one file (song lyrics, sound descriptions) are kept
 without a gloss if they're in the timestamp file, and dropped otherwise; the

@@ -142,21 +142,40 @@ def _count_overlapping(reference: list[Cue], other: list[Cue], offset: int) -> i
     return count
 
 
-def estimate_offset(reference: list[Cue], other: list[Cue]) -> tuple[int, float]:
-    """Estimate how many ms to add to `other` cues to land on `reference` time.
+def _overlap_score(reference: list[Cue], other: list[Cue], offset: int) -> int:
+    """Sum over `other` cues of their best single-reference-cue overlap, in ms.
+
+    Counting merely *whether* a cue overlaps something saturates in dense
+    dialogue, where nearly any offset overlaps almost every cue with some
+    neighbor. The best single-cue overlap keeps discriminating: at the true
+    offset a cue nests inside its counterpart (overlap ≈ its whole duration),
+    while one cue off it straddles a boundary and only a fraction counts.
+    """
+    ref_starts = [c.start for c in reference]
+    total = 0
+    for cue in other:
+        start, end = cue.start + offset, cue.end + offset
+        pos = bisect_left(ref_starts, end)
+        best = 0
+        for ref in reference[max(0, pos - 4):pos + 1]:
+            ov = min(ref.end, end) - max(ref.start, start)
+            if ov > best:
+                best = ov
+        total += best
+    return total
+
+
+def _offset_candidates(reference: list[Cue], other: list[Cue]) -> list[int]:
+    """Candidate offsets from a vote over all plausible cue pairings.
 
     Every pairing of an `other` cue with a reference cue starting within
     MAX_AUTO_OFFSET_MS proposes a delta. The true offset shows up as a dense
     cluster of near-identical deltas (one vote from nearly every cue), while
-    coincidental pairings scatter. The densest clusters are then verified by
-    actually shifting the cues and counting real overlaps, which breaks ties
-    when dialogue is evenly spaced. Returns (offset_ms, support) where support
-    is the fraction of `other` cues that overlap a reference cue at the
-    chosen offset.
+    coincidental pairings scatter. Retimed subs can spread the true offset's
+    votes across neighboring windows, letting coincidental clusters out-vote
+    it, so the cutoff is deliberately loose — callers verify candidates by
+    actual overlap.
     """
-    if not reference or not other:
-        return 0, 0.0
-
     ref_starts = sorted(c.start for c in reference)
     deltas: list[int] = []
     for cue in other:
@@ -164,7 +183,7 @@ def estimate_offset(reference: list[Cue], other: list[Cue]) -> tuple[int, float]
         hi = bisect_right(ref_starts, cue.start + MAX_AUTO_OFFSET_MS)
         deltas.extend(s - cue.start for s in ref_starts[lo:hi])
     if not deltas:
-        return 0, 0.0
+        return []
     deltas.sort()
 
     # Sliding-window cluster sizes over the sorted deltas.
@@ -177,24 +196,40 @@ def estimate_offset(reference: list[Cue], other: list[Cue]) -> tuple[int, float]
             hi += 1
         windows.append((hi - lo, lo, hi))
 
-    # Top few non-overlapping clusters become candidate offsets.
     windows.sort(key=lambda w: -w[0])
     candidates: list[int] = []
     taken: list[tuple[int, int]] = []
     for count, lo, hi in windows:
-        if len(candidates) >= 5 or count < windows[0][0] // 2:
+        if len(candidates) >= 8 or count < windows[0][0] // 4:
             break
         if any(lo < t_hi and hi > t_lo for t_lo, t_hi in taken):
             continue
         candidates.append(int(statistics.median(deltas[lo:hi])))
         taken.append((lo, hi))
+    return candidates
+
+
+def estimate_offset(reference: list[Cue], other: list[Cue]) -> tuple[int, float]:
+    """Estimate how many ms to add to `other` cues to land on `reference` time.
+
+    Candidate offsets come from the pairing vote; they are verified by
+    actually shifting the cues and measuring real overlap, which keeps
+    discriminating even when dialogue is dense and evenly spaced. Returns
+    (offset_ms, support) where support is the fraction of `other` cues that
+    overlap a reference cue at the chosen offset.
+    """
+    if not reference or not other:
+        return 0, 0.0
 
     best_offset, best_score = 0, -1
-    for offset in candidates:
-        score = _count_overlapping(reference, other, offset)
+    for offset in _offset_candidates(reference, other):
+        score = _overlap_score(reference, other, offset)
         if score > best_score:
             best_offset, best_score = offset, score
-    return best_offset, best_score / len(other)
+    if best_score < 0:
+        return 0, 0.0
+    support = _count_overlapping(reference, other, best_offset) / len(other)
+    return best_offset, support
 
 
 def shift_cues(cues: list[Cue], offset_ms: int) -> list[Cue]:
@@ -250,7 +285,7 @@ def estimate_time_map(
     for cand_rate in [1.0] + [ratio for ratio, _ in COMMON_RATE_RATIOS]:
         scaled = scale_cues(other, cand_rate, 0.0)
         cand_offset, _ = estimate_offset(reference, scaled)
-        score = _count_overlapping(reference, scaled, cand_offset)
+        score = _overlap_score(reference, scaled, cand_offset)
         candidates.append((score, cand_rate, float(cand_offset)))
 
     window = max(len(other) // min(10, max(4, len(other) // 40)), 8)
@@ -266,7 +301,7 @@ def estimate_time_map(
         slope, intercept = _theil_sen(anchors)  # local offset over time
         if 0.9 <= 1.0 + slope <= 1.1:
             scaled = scale_cues(other, 1.0 + slope, intercept)
-            score = _count_overlapping(reference, scaled, 0)
+            score = _overlap_score(reference, scaled, 0)
             candidates.append((score, 1.0 + slope, intercept))
 
     _, rate, offset = max(candidates)
@@ -296,6 +331,123 @@ def estimate_time_map(
     return rate, offset, matched / len(other)
 
 
+# Piecewise tuning: cue window for local offset estimates, how close two
+# local offsets must be to count as the same segment, and the overlap cost
+# (ms) of switching segments in the per-cue assignment.
+PIECEWISE_WINDOW = 25
+PIECEWISE_CLUSTER_MS = 600
+PIECEWISE_SWITCH_PENALTY_MS = 3000
+
+
+def estimate_piecewise_offsets(
+    reference: list[Cue], other: list[Cue]
+) -> list[tuple[int, int, int]] | None:
+    """Detect sync jumps: assign each `other` cue one of a few constant offsets.
+
+    Subs timed for a release with different commercial breaks or an extra
+    scene are off by a *different* constant in each stretch of the file, so
+    neither one offset nor a linear map fits. Local offsets estimated in
+    windows of cues propose the candidate constants; a Viterbi pass then
+    gives every cue the candidate that maximizes its overlap with the
+    reference, charging a penalty per switch so the assignment stays
+    piecewise instead of cherry-picking per cue.
+
+    Returns segments as (first_cue_index, one_past_last_index, offset_ms),
+    or None when a single offset explains the whole file.
+    """
+    if len(other) < 2 * PIECEWISE_WINDOW:
+        return None
+
+    local: list[int] = []
+    for lo in range(0, len(other), PIECEWISE_WINDOW):
+        chunk = other[lo:lo + PIECEWISE_WINDOW]
+        if len(chunk) < 10:
+            continue
+        offset, support = estimate_offset(reference, chunk)
+        if support >= 0.5:
+            local.append(offset)
+    if not local:
+        return None
+
+    local.sort()
+    clusters: list[list[int]] = [[local[0]]]
+    for offset in local[1:]:
+        if offset - clusters[-1][-1] <= PIECEWISE_CLUSTER_MS:
+            clusters[-1].append(offset)
+        else:
+            clusters.append([offset])
+    clusters.sort(key=len, reverse=True)
+    candidates = [int(statistics.median(c)) for c in clusters[:6]]
+    if len(candidates) < 2:
+        return None
+
+    # Short windows can vote for coincidental offsets and miss real ones
+    # entirely; the full-file vote is far more robust, so its top clusters
+    # join the candidate pool (deduplicated) and the per-cue assignment
+    # below decides which offsets actually apply where.
+    for offset in _offset_candidates(reference, other):
+        if all(abs(offset - c) > PIECEWISE_CLUSTER_MS // 2 for c in candidates):
+            candidates.append(offset)
+
+    ref_starts = [c.start for c in reference]
+
+    def cue_overlap(cue: Cue, offset: int) -> int:
+        start, end = cue.start + offset, cue.end + offset
+        pos = bisect_left(ref_starts, end)
+        best = 0
+        for ref in reference[max(0, pos - 4):pos + 1]:
+            ov = min(ref.end, end) - max(ref.start, start)
+            if ov > best:
+                best = ov
+        return best
+
+    # Viterbi over candidate offsets: total = sum of per-cue overlaps minus
+    # the penalty for each offset switch.
+    totals = [0.0] * len(candidates)
+    back: list[list[int]] = []
+    for cue in other:
+        best_prev = max(totals)
+        best_k = totals.index(best_prev)
+        row: list[int] = []
+        new_totals: list[float] = []
+        for k, offset in enumerate(candidates):
+            if totals[k] >= best_prev - PIECEWISE_SWITCH_PENALTY_MS:
+                stay_from = k
+                base = totals[k]
+            else:
+                stay_from = best_k
+                base = best_prev - PIECEWISE_SWITCH_PENALTY_MS
+            row.append(stay_from)
+            new_totals.append(base + cue_overlap(cue, offset))
+        back.append(row)
+        totals = new_totals
+
+    k = totals.index(max(totals))
+    assigned = [0] * len(other)
+    for i in range(len(other) - 1, -1, -1):
+        assigned[i] = k
+        k = back[i][k]
+
+    segments: list[tuple[int, int, int]] = []
+    run_start = 0
+    for i in range(1, len(other) + 1):
+        if i == len(other) or assigned[i] != assigned[run_start]:
+            segments.append((run_start, i, candidates[assigned[run_start]]))
+            run_start = i
+    if len(segments) == 1:
+        return None
+    return segments
+
+
+def apply_piecewise_offsets(
+    cues: list[Cue], segments: list[tuple[int, int, int]]
+) -> list[Cue]:
+    shifted: list[Cue] = []
+    for lo, hi, offset in segments:
+        shifted.extend(shift_cues(cues[lo:hi], offset))
+    return shifted
+
+
 def overlap_ms(a: Cue, b: Cue) -> int:
     return min(a.end, b.end) - max(a.start, b.start)
 
@@ -322,6 +474,70 @@ def align(reference: list[Cue], other: list[Cue], min_overlap: float) -> dict[in
         if shorter > 0 and best_ov >= min_overlap * shorter:
             mapping[best_i].append(j)
     return mapping
+
+
+_MARKUP_RE = re.compile(r"<[^>]+>|\{[^}]*\}")
+
+
+def _ends_sentence(text: str) -> bool:
+    """Whether a cue's text looks like it completes a sentence.
+
+    Trailing ellipsis is the subtitle convention for "continues in the next
+    cue", so it does not count as an ending. Closing brackets and quotes do:
+    sound descriptions like "[Musik]" and quoted sentences are complete.
+    """
+    t = _MARKUP_RE.sub("", text).strip()
+    if not t:
+        return True
+    if t.endswith(("...", "…")):
+        return False
+    return t[-1] in '.!?。！？)]"\'»”'
+
+
+def _starts_mid_sentence(text: str) -> bool:
+    t = _MARKUP_RE.sub("", text).strip()
+    if t.startswith(("...", "…")):
+        return True
+    t = t.lstrip('-–—"\'«„“ ')
+    return bool(t) and t[0].islower()
+
+
+def _is_sentence_fragment(cues: list[Cue], i: int) -> bool:
+    """Whether cue i looks like one piece of a sentence spanning several cues."""
+    if not _ends_sentence(cues[i].text) or _starts_mid_sentence(cues[i].text):
+        return True
+    return i > 0 and not _ends_sentence(cues[i - 1].text)
+
+
+def fill_fragment_gaps(
+    mapping: dict[int, list[int]],
+    reference: list[Cue],
+    other: list[Cue],
+    min_overlap: float,
+) -> int:
+    """Give glossless mid-sentence reference cues the other cues overlapping them.
+
+    The primary alignment assigns each `other` cue to its single best
+    reference cue, so when the reference file splits a sentence into more
+    cues than the other file does, a middle fragment ends up with no gloss at
+    all. Such a fragment borrows every `other` cue that overlaps it by the
+    ordinary threshold — a duplicated but honest translation beats a missing
+    one. Only cues whose punctuation marks them as mid-sentence fragments are
+    filled, so genuinely untranslated cues (interjections, sound
+    descriptions) stay bare. Returns how many reference cues were filled.
+    """
+    filled = 0
+    for i, ref in enumerate(reference):
+        if mapping[i] or not _is_sentence_fragment(reference, i):
+            continue
+        for j, cue in enumerate(other):
+            ov = overlap_ms(ref, cue)
+            shorter = min(ref.duration, cue.duration)
+            if shorter > 0 and ov >= min_overlap * shorter:
+                mapping[i].append(j)
+        if mapping[i]:
+            filled += 1
+    return filled
 
 
 @dataclass(frozen=True)
@@ -464,9 +680,13 @@ def merge(
     """
     reference, other = (main, gloss) if timestamps_from_main else (gloss, main)
     mapping = align(reference, other, min_overlap)
+    # `matched` deliberately counts only primary matches: the drift and jump
+    # corrections compare merges by it, and fragment fill would reward bad
+    # alignments (which leave more gaps to fill) as much as good ones.
+    matched_refs = sum(1 for js in mapping.values() if js)
+    filled = fill_fragment_gaps(mapping, reference, other, min_overlap)
 
     merged: list[MergedCue] = []
-    matched_refs = 0
     used_other = set()
     for i, ref in enumerate(reference):
         partners = mapping[i]
@@ -476,18 +696,46 @@ def merge(
         )
         main_text = ref.text if timestamps_from_main else partner_text
         gloss_text = partner_text if timestamps_from_main else " ".join(ref.text.split())
-        if partners:
-            matched_refs += 1
         if main_text or gloss_text:
             merged.append(MergedCue(start=ref.start, end=ref.end, main=main_text, gloss=gloss_text))
 
     stats = {
         "reference_cues": len(reference),
         "matched": matched_refs,
-        "unmatched": len(reference) - matched_refs,
+        "filled": filled,
+        "unmatched": len(reference) - matched_refs - filled,
         "unused_other": len(other) - len(used_other),
     }
     return merged, stats
+
+
+# Consecutive cues showing the same gloss text (fragment fill duplicates one
+# translation across a sentence's cues) render as a single steady gloss event
+# in top position, provided the gap between them is at most this long.
+GLOSS_SPAN_MAX_GAP_MS = 1000
+
+
+def _gloss_spans(merged: list[MergedCue]) -> list[tuple[int, int, str]]:
+    """Merge consecutive cues with identical gloss into (start, end, text) spans.
+
+    Re-rendering the same borrowed translation once per fragment makes it
+    flicker; collapsed into one span it simply stays on screen while the main
+    cues change. Only exact text repeats within GLOSS_SPAN_MAX_GAP_MS merge,
+    so a genuinely repeated line later in the dialogue stays its own event.
+    """
+    spans: list[list] = []
+    for cue in merged:
+        if not cue.gloss:
+            continue
+        if (
+            spans
+            and spans[-1][2] == cue.gloss
+            and cue.start - spans[-1][1] <= GLOSS_SPAN_MAX_GAP_MS
+        ):
+            spans[-1][1] = max(spans[-1][1], cue.end)
+        else:
+            spans.append([cue.start, cue.end, cue.gloss])
+    return [(start, end, text) for start, end, text in spans]
 
 
 def write_srt(cues: list[Cue]) -> str:
@@ -505,6 +753,7 @@ def render_srt(merged: list[MergedCue], gloss_position: str = "below") -> str:
     "below": gloss in italics beneath the main text, one cue block.
     "top": gloss as a second, simultaneous cue tagged {\\an8} (top-center) —
     understood by VLC, mpv, and Kodi; other players show it as a normal cue.
+    Consecutive identical glosses become one spanning cue (see _gloss_spans).
     SRT has no reliable font-size control; use ASS output for sizes.
     """
     blocks: list[str] = []
@@ -515,13 +764,19 @@ def render_srt(merged: list[MergedCue], gloss_position: str = "below") -> str:
             f"{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n"
         )
 
-    for cue in merged:
-        gloss = f"<i>{cue.gloss}</i>" if cue.gloss else ""
-        if gloss_position == "top" and gloss:
+    if gloss_position == "top":
+        events: list[tuple[int, int, int, str]] = []  # (start, order, end, text)
+        for cue in merged:
             if cue.main:
-                block(cue.start, cue.end, cue.main)
-            block(cue.start, cue.end, "{\\an8}" + gloss)
-        else:
+                events.append((cue.start, 0, cue.end, cue.main))
+        for start, end, text in _gloss_spans(merged):
+            events.append((start, 1, end, "{\\an8}" + f"<i>{text}</i>"))
+        events.sort(key=lambda e: e[:2])
+        for start, _, end, text in events:
+            block(start, end, text)
+    else:
+        for cue in merged:
+            gloss = f"<i>{cue.gloss}</i>" if cue.gloss else ""
             text = "\n".join(part for part in (cue.main, gloss) if part)
             block(cue.start, cue.end, text)
     return "\n".join(blocks)
@@ -566,34 +821,40 @@ def render_ass(
     """Render merged cues as ASS with real font-size control.
 
     "below": one event per cue, gloss on its own line in a smaller italic
-    font. "top": gloss as a separate event with the Gloss style, top-center.
+    font. "top": gloss as a separate event with the Gloss style, top-center;
+    consecutive identical glosses become one spanning event (_gloss_spans).
     The gloss is slightly gray in both cases to set it apart from the main
     text. Sizes are relative to a 1280×720 canvas; players scale them.
     """
     gloss_size = max(1, round(font_size * gloss_scale))
     lines = [ASS_HEADER.format(main_size=font_size, gloss_size=gloss_size)]
 
-    def event(cue: MergedCue, style: str, text: str) -> None:
+    def event(start: int, end: int, style: str, text: str) -> None:
         lines.append(
-            f"Dialogue: 0,{format_ass_timestamp(cue.start)},"
-            f"{format_ass_timestamp(cue.end)},{style},,0,0,0,,{text}"
+            f"Dialogue: 0,{format_ass_timestamp(start)},"
+            f"{format_ass_timestamp(end)},{style},,0,0,0,,{text}"
         )
 
-    inline_gloss = f"{{\\fs{gloss_size}\\i1\\c&HD8D8D8&}}"
-    for cue in merged:
-        main = _ass_escape(cue.main)
-        gloss = _ass_escape(cue.gloss)
-        if gloss_position == "top":
-            if main:
-                event(cue, "Main", main)
-            if gloss:
-                event(cue, "Gloss", gloss)
-        else:
+    if gloss_position == "top":
+        events: list[tuple[int, int, int, str, str]] = []
+        for cue in merged:
+            if cue.main:
+                events.append((cue.start, 0, cue.end, "Main", _ass_escape(cue.main)))
+        for start, end, text in _gloss_spans(merged):
+            events.append((start, 1, end, "Gloss", _ass_escape(text)))
+        events.sort(key=lambda e: e[:2])
+        for start, _, end, style, text in events:
+            event(start, end, style, text)
+    else:
+        inline_gloss = f"{{\\fs{gloss_size}\\i1\\c&HD8D8D8&}}"
+        for cue in merged:
+            main = _ass_escape(cue.main)
+            gloss = _ass_escape(cue.gloss)
             if gloss:
                 joined = f"{main}\\N{inline_gloss}{gloss}" if main else f"{inline_gloss}{gloss}"
             else:
                 joined = main
-            event(cue, "Main", joined)
+            event(cue.start, cue.end, "Main", joined)
     return "\n".join(lines) + "\n"
 
 
@@ -690,6 +951,19 @@ def main(argv: list[str] | None = None) -> int:
                 report = check_sync(reference, corrected, args.min_overlap)
                 correction = (rate, lin_offset)
 
+    # Neither fits when the offset jumps mid-file (releases with different
+    # commercial breaks); try piecewise offsets, keep them if they match more.
+    jump_segments = None
+    if args.offset is None and correction is None:
+        segments = estimate_piecewise_offsets(reference, other_raw)
+        if segments is not None:
+            corrected = apply_piecewise_offsets(other_raw, segments)
+            merged2, stats2 = run_merge(corrected)
+            if stats2["matched"] > stats["matched"]:
+                merged, stats, other = merged2, stats2, corrected
+                report = check_sync(reference, corrected, args.min_overlap)
+                jump_segments = segments
+
     to_stdout = args.output is not None and str(args.output) == "-"
     out_format = args.format
     if out_format is None:
@@ -724,15 +998,34 @@ def main(argv: list[str] | None = None) -> int:
             f"offset {lin_offset / 1000:+.2f} s",
             file=sys.stderr,
         )
+    elif jump_segments is not None:
+        print(
+            f"sync-jump correction applied to non-timestamp file, "
+            f"{len(jump_segments)} segments:",
+            file=sys.stderr,
+        )
+        source = other_raw
+        for lo, hi, seg_offset in jump_segments:
+            span = (
+                f"{format_timestamp(source[lo].start)[:8]}–"
+                f"{format_timestamp(source[hi - 1].end)[:8]}"
+            )
+            print(f"  {span}  {seg_offset:+d} ms  ({hi - lo} cues)", file=sys.stderr)
     else:
         detected = "manual" if support is None else f"auto, {support:.0%} of cues agree"
         print(
             f"offset applied to non-timestamp file: {offset:+d} ms ({detected})",
             file=sys.stderr,
         )
+    filled_note = (
+        f" ({stats['filled']} sentence fragments sharing a neighbor's gloss)"
+        if stats["filled"]
+        else ""
+    )
     print(
         f"cues: {stats['reference_cues']} from timestamp file, "
-        f"{stats['matched']} glossed, {stats['unmatched']} without gloss, "
+        f"{stats['matched'] + stats['filled']} glossed{filled_note}, "
+        f"{stats['unmatched']} without gloss, "
         f"{stats['unused_other']} from the other file unused",
         file=sys.stderr,
     )
