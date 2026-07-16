@@ -72,6 +72,33 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(format_timestamp(0), "00:00:00,000")
 
 
+class EncodingTests(unittest.TestCase):
+    def _decode(self, content: str, encoding: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sub.srt"
+            path.write_bytes(content.encode(encoding))
+            return kinogloss.read_srt_text(path)
+
+    SRT = "1\n00:00:01,000 --> 00:00:02,000\n{}\n"
+
+    def test_cp1251_russian(self):
+        line = "Что вы никогда его не найдёте? Хорошо, я скажу вам."
+        self.assertIn(line, self._decode(self.SRT.format(line), "cp1251"))
+
+    def test_cp1250_polish(self):
+        line = "Właśnie żółtą łąkę zdążyłem ćwiczyć, część pierwsza."
+        self.assertIn(line, self._decode(self.SRT.format(line), "cp1250"))
+
+    def test_cp1252_western(self):
+        line = "Fällt der Zug aus? Voilà, ça marche déjà süß."
+        self.assertIn(line, self._decode(self.SRT.format(line), "cp1252"))
+
+    def test_utf8_and_utf16_bom(self):
+        line = "Смешанный текст, mixed text, ładny."
+        for encoding in ("utf-8", "utf-8-sig", "utf-16"):
+            self.assertIn(line, self._decode(self.SRT.format(line), encoding))
+
+
 class OffsetTests(unittest.TestCase):
     def test_detects_constant_offset(self):
         ref = parse_srt(GERMAN)
@@ -457,6 +484,31 @@ class JumpCorrectionTests(unittest.TestCase):
             self.assertLessEqual(abs(seg_lo - true_lo), 2)
             self.assertLessEqual(abs(seg_offset - true_offset), 150)
         self.assertEqual(segments[-1][1], len(other))
+
+    def test_tiny_rogue_segment_is_dissolved(self):
+        # Five cues only one translator subtitled: their reference partners
+        # sit at a +9000 offset no real segment uses. The rogue offset is
+        # injected as a candidate; the assignment must not keep a 5-cue
+        # segment for it.
+        ref, other = self._jumpy_pair()
+        for i in range(100, 105):
+            ref[i] = Cue(other[i].start + 9000, other[i].end + 9000, ref[i].text)
+        ref.sort(key=lambda c: c.start)
+        original = kinogloss._offset_candidates
+        kinogloss._offset_candidates = lambda r, o: original(r, o) + [9000]
+        try:
+            segments = kinogloss.estimate_piecewise_offsets(ref, other)
+        finally:
+            kinogloss._offset_candidates = original
+        self.assertIsNotNone(segments)
+        self.assertTrue(
+            all(
+                hi - lo >= kinogloss.PIECEWISE_MIN_SEGMENT_CUES
+                for lo, hi, _ in segments
+            ),
+            segments,
+        )
+        self.assertNotIn(9000, {offset for _, _, offset in segments})
 
     def test_constant_offset_yields_no_segments(self):
         ref, other = self._jumpy_pair()

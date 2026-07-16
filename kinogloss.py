@@ -93,12 +93,38 @@ def format_timestamp(ms: int) -> str:
 
 
 def read_srt_text(path: Path) -> str:
+    """Decode a subtitle file, handling common legacy encodings.
+
+    UTF-16 is only attempted when a BOM or NUL bytes betray it; UTF-8 is
+    tried next. Legacy single-byte files are ambiguous — most cp1251 (or
+    cp1250) bytes also decode "successfully" as cp1252, just into the wrong
+    letters — so every common codepage is tried and scored by how many
+    non-ASCII characters come out alphabetic: the wrong codepage turns
+    frequent letters into symbols (cp1251 'ч' becomes cp1252 '÷', Polish
+    cp1250 'ł' becomes '³'), while the right one yields letters throughout.
+    """
     raw = path.read_bytes()
-    for encoding in ("utf-8-sig", "utf-8", "utf-16", "cp1252"):
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in raw[:200]:
         try:
-            return raw.decode(encoding)
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    best_text, best_key = None, None
+    for priority, encoding in enumerate(("cp1252", "cp1250", "cp1251")):
+        try:
+            text = raw.decode(encoding)
         except UnicodeDecodeError:
             continue
+        score = sum(1 for c in text if ord(c) > 127 and c.isalpha())
+        key = (score, -priority)
+        if best_key is None or key > best_key:
+            best_text, best_key = text, key
+    if best_text is not None:
+        return best_text
     return raw.decode("latin-1")
 
 
@@ -332,11 +358,13 @@ def estimate_time_map(
 
 
 # Piecewise tuning: cue window for local offset estimates, how close two
-# local offsets must be to count as the same segment, and the overlap cost
-# (ms) of switching segments in the per-cue assignment.
+# local offsets must be to count as the same segment, the overlap cost (ms)
+# of switching segments in the per-cue assignment, and the shortest run of
+# cues accepted as a real segment (commercial breaks move whole scenes).
 PIECEWISE_WINDOW = 25
 PIECEWISE_CLUSTER_MS = 600
 PIECEWISE_SWITCH_PENALTY_MS = 3000
+PIECEWISE_MIN_SEGMENT_CUES = 8
 
 
 def estimate_piecewise_offsets(
@@ -434,6 +462,40 @@ def estimate_piecewise_offsets(
         if i == len(other) or assigned[i] != assigned[run_start]:
             segments.append((run_start, i, candidates[assigned[run_start]]))
             run_start = i
+
+    # Dissolve implausibly short runs: a handful of cues with no true
+    # partner (say, a stretch only one translator subtitled) can buy fake
+    # overlap at an arbitrary offset and drag real neighbors with them.
+    # Their cues go to whichever neighboring offset overlaps them best —
+    # often none, which correctly leaves them unglossed.
+    while len(segments) > 1:
+        idx = min(
+            (
+                i for i, (lo, hi, _) in enumerate(segments)
+                if hi - lo < PIECEWISE_MIN_SEGMENT_CUES
+            ),
+            key=lambda i: segments[i][1] - segments[i][0],
+            default=None,
+        )
+        if idx is None:
+            break
+        lo, hi, _ = segments[idx]
+        neighbors = {
+            segments[i][2] for i in (idx - 1, idx + 1) if 0 <= i < len(segments)
+        }
+        best = max(
+            neighbors,
+            key=lambda off: sum(cue_overlap(c, off) for c in other[lo:hi]),
+        )
+        segments[idx] = (lo, hi, best)
+        joined = [segments[0]]
+        for seg in segments[1:]:
+            if seg[2] == joined[-1][2]:
+                joined[-1] = (joined[-1][0], seg[1], seg[2])
+            else:
+                joined.append(seg)
+        segments = joined
+
     if len(segments) == 1:
         return None
     return segments
