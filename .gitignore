@@ -11,3 +11,7 @@ samples/
 # Generated subtitle output
 *.gloss.srt
 *.gloss.ass
+
+# Bazarr hook: local settings and log
+bazarr_hook.json
+bazarr_hook.log

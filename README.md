@@ -179,8 +179,54 @@ summary printed at the end counts both.
 - Italic tags (`<i>…</i>`) are supported by VLC, mpv, Plex, Kodi, and most
   other players.
 
+## Bazarr integration
+
+Bazarr has no plugin API. Its extension point is the custom post-processing
+command, which runs once for every subtitle Bazarr downloads. `bazarr_hook.py`
+plugs KinoGloss into that:
+
+- When a subtitle in a **study language** arrives (e.g. Russian), it becomes
+  MAIN and the video's English track becomes GLOSS. That is an English sidecar
+  (`<video>.en.srt`, else `.en.sdh.srt`), or failing that an embedded English
+  text track pulled out with Bazarr's bundled ffmpeg. Forced tracks are never
+  used as a gloss.
+- When an **English** subtitle arrives, every study-language sidecar already
+  next to the video is (re)glossed with it.
+- Output is `<video stem>.<lang>.ass` next to the video, so Plex lists it under
+  the study language, as "ASS" beside the plain "SRT" track. An existing `.ass`
+  that KinoGloss did not write is left alone.
+
+In Bazarr: *Settings → Subtitles → Post-Processing*, enable it, and set the
+command to
+
+```
+D:\Arr\bazarr-python\python.exe D:\Projekte\KinoGloss\bazarr_hook.py {{episode}} {{subtitles}} {{subtitles_language_code2}}
+```
+
+The interpreter path must contain **no spaces and no quotes**. On Windows,
+Bazarr splits the command with `shlex(posix=False)`, which keeps quotes
+inside the arguments, so a quoted `"D:\Program Files\…\python.exe"` fails
+with *Access denied*. `D:\Arr\bazarr-python` is a junction to Bazarr's own
+WinPython (`D:\Program Files\Bazarr\WinPython\python-3.13.11.1`); recreate it
+after a Bazarr update that changes the Python version:
+
+```powershell
+New-Item -ItemType Junction -Path D:\Arr\bazarr-python -Target "D:\Program Files\Bazarr\WinPython\python-3.13.11.1"
+```
+
+Settings (study languages, which file supplies the timing, ASS size and
+position) can be overridden in `bazarr_hook.json` beside the script; see
+`DEFAULTS` in `bazarr_hook.py`. The script writes its full report to
+`bazarr_hook.log`, and Bazarr's log gets a one-line summary.
+
+To gloss films that already have both subtitles, without Bazarr:
+
+```bash
+python3 bazarr_hook.py --backfill "/mnt/e/Medien/Kino" --dry-run
+```
+
 ## Tests
 
 ```bash
-python3 -m unittest test_kinogloss -v
+python3 -m unittest test_kinogloss test_bazarr_hook -v
 ```
