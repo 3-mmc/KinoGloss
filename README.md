@@ -15,6 +15,22 @@ sync, and stamps the output with the timeline of whichever file you choose.
 
 Requires Python 3.9+. No dependencies.
 
+## Example output
+
+Default: the study language on top, the smaller italic gloss beneath it
+(`-o film.gloss.ass`):
+
+![Bilingual subtitles, gloss below the main line](docs/screenshots/gloss-below.png)
+
+With `--gloss-position top` the gloss moves to the top-center of the
+screen, so you can try reading the main language first and glance up only
+when needed:
+
+![Bilingual subtitles, gloss at the top of the screen](docs/screenshots/gloss-top.png)
+
+Mock frames rendered with the same sizes and colors as the ASS output
+(main white, gloss light gray at 75% size).
+
 ## Usage
 
 ```bash
