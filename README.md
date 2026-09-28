@@ -1,7 +1,7 @@
 # KinoGloss
 
 Merge two SRT subtitle files of different languages into a single bilingual
-SRT for language learning: the main language on top, the gloss language
+subtitle file (SRT or ASS) for language learning: the main language on top, the gloss language
 beneath it in italics.
 
 ```
