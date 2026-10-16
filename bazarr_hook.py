@@ -201,7 +201,8 @@ def fresh(video: Path, main_srt: Path, lang: str, cfg: dict) -> bool:
     if not out.exists() or not ours_or_absent(out, cfg) or cfg["overwrite_foreign_ass"]:
         return False
     deps = [main_srt, *sidecars(video, cfg["gloss_language"])[:1]]
-    return out.stat().st_mtime >= max(d.stat().st_mtime for d in deps)
+    # ctime too: rsync -t and copies keep old mtimes on newly arrived files
+    return out.stat().st_mtime >= max(max(d.stat().st_mtime, d.stat().st_ctime) for d in deps)
 
 
 def handle(video: Path, subtitle: Path, lang: str, cfg: dict, dry: bool = False,
