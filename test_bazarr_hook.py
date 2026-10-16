@@ -131,6 +131,14 @@ class HookTest(unittest.TestCase):
         self.assertEqual(bazarr_hook.handle(self.video, ru, "ru", self.cfg, skip_fresh=True),
                          ["wrote Film (2000).ru.ass"])
 
+    def test_mismatched_pair_is_dropped(self):
+        ru = self.write("Film (2000).ru.srt", RUSSIAN)
+        unrelated = ENGLISH.replace("00:00:0", "00:10:0")  # no cue overlaps
+        self.write("Film (2000).en.srt", unrelated)
+        result = bazarr_hook.handle(self.video, ru, "ru", self.cfg)
+        self.assertIn("cues matched", result[0])
+        self.assertFalse((self.dir / "Film (2000).ru.ass").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
