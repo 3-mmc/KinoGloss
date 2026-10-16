@@ -139,6 +139,23 @@ class HookTest(unittest.TestCase):
         self.assertIn("cues matched", result[0])
         self.assertFalse((self.dir / "Film (2000).ru.ass").exists())
 
+    def test_rejected_pair_keeps_existing_output_it_cannot_remove(self):
+        import os, stat
+        ru = self.write("Film (2000).ru.srt", RUSSIAN)
+        self.write("Film (2000).en.srt", ENGLISH.replace("00:00:0", "00:10:0"))
+        old = self.write("Film (2000).ru.ass", f"[Script Info]\n{bazarr_hook.MARKER}\nold\n")
+        os.chmod(self.dir, stat.S_IRUSR | stat.S_IXUSR | stat.S_IWUSR | stat.S_ISVTX)
+        real_unlink = Path.unlink
+        def deny(path, *a, **k):
+            raise PermissionError(1, "Operation not permitted")
+        Path.unlink = deny
+        try:
+            result = bazarr_hook.handle(self.video, ru, "ru", self.cfg)
+        finally:
+            Path.unlink = real_unlink
+        self.assertIn("could NOT remove", result[0])
+        self.assertIn("old", old.read_text(encoding="utf-8"))  # not clobbered
+
 
 if __name__ == "__main__":
     unittest.main()

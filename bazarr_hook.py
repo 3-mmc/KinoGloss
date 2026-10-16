@@ -181,6 +181,29 @@ def gloss(video: Path, main_srt: Path, lang: str, gloss_srt: Path, cfg: dict, dr
         return f"skip {out.name}: an .ass not written by KinoGloss is already there"
     if dry:
         return f"would write {out.name}  (main {main_srt.name}, gloss {gloss_srt.name})"
+    # Build in a temp dir and only then replace `out`, so a rejected pair never
+    # clobbers what is there. Replace by rewriting in place: a sticky library
+    # folder may let us write a file another user owns but not unlink it.
+    with tempfile.TemporaryDirectory() as tmp:
+        built = Path(tmp) / "out.ass"
+        msg = _build(main_srt, gloss_srt, built, cfg)
+        if msg:
+            if out.exists() and "cues matched" in msg:
+                try:
+                    out.unlink()
+                    msg += f"; removed the old {out.name}"
+                except OSError as e:
+                    msg += f"; could NOT remove the old {out.name} ({e.strerror})"
+            return f"skip {out.name}: {msg}"
+        text = built.read_text(encoding="utf-8")
+    if MARKER not in text[:400]:
+        text = text.replace("[Script Info]", f"[Script Info]\n{MARKER}", 1)
+    out.write_text(text, encoding="utf-8")
+    return f"wrote {out.name}"
+
+
+def _build(main_srt: Path, gloss_srt: Path, out: Path, cfg: dict) -> str | None:
+    """Run KinoGloss into `out`; return why the result is unusable, or None."""
     argv = [str(main_srt), str(gloss_srt), "-o", str(out), "--format", "ass",
             "--timestamps", "2" if cfg["timestamps"] == "gloss" else "1",
             "--gloss-position", cfg["gloss_position"],
@@ -194,13 +217,9 @@ def gloss(video: Path, main_srt: Path, lang: str, gloss_srt: Path, cfg: dict, dr
         return f"KinoGloss failed ({rc}) for {main_srt.name}"
     m = re.search(r"cues: (\d+) from timestamp file, (\d+) glossed", report.getvalue())
     if m and int(m[1]) and int(m[2]) / int(m[1]) < cfg["min_gloss_ratio"]:
-        out.unlink()
-        return (f"skip {out.name}: only {int(m[2])}/{int(m[1])} cues matched"
+        return (f"only {int(m[2])}/{int(m[1])} cues matched"
                 f" ({main_srt.name} and {gloss_srt.name} probably differ in cut or film)")
-    text = out.read_text(encoding="utf-8")
-    if MARKER not in text[:400]:
-        out.write_text(text.replace("[Script Info]", f"[Script Info]\n{MARKER}", 1), encoding="utf-8")
-    return f"wrote {out.name}"
+    return None
 
 
 def fresh(video: Path, main_srt: Path, lang: str, cfg: dict) -> bool:
@@ -247,7 +266,11 @@ def backfill(root: Path, cfg: dict, dry: bool, quiet: bool = False) -> None:
         for lang in study_langs(video, cfg):
             main = sidecars(video, lang)
             if main:
-                for r in handle(video, main[0], lang, cfg, dry, skip_fresh=True):
+                try:
+                    results = handle(video, main[0], lang, cfg, dry, skip_fresh=True)
+                except Exception as e:  # one bad file must not stop the scan
+                    results = [f"error on {main[0].name}: {e!r}"]
+                for r in results:
                     if quiet and r.startswith("up to date"):
                         continue
                     print(f"{video.parent.name}: {r}", flush=True)
