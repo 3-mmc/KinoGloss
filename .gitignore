@@ -15,3 +15,4 @@ samples/
 # Bazarr hook: local settings and log
 bazarr_hook.json
 bazarr_hook.log
+.run.lock

@@ -246,16 +246,32 @@ sidecar. Backfill skips outputs newer than their inputs (by mtime or arrival
 time), so it can run on a timer over a whole library, with `--quiet` to hide
 the "up to date" lines. A pair where fewer than `min_gloss_ratio` (0.5) of the
 cues find a partner is dropped, since that usually means a different cut or
-the wrong film. On a Linux server, a systemd timer can run it hourly:
+the wrong film.
+
+On a Linux server, `kinogloss_watch.sh` (needs `inotify-tools`) watches the
+library and glosses a folder about 30 s after a `.srt` lands in it, so nothing
+rescans the whole library every hour. inotify also sees files written into a
+bind mount from the host. A weekly backfill catches anything the watcher
+missed while it was down; both take the same `flock`, so they never write the
+same file at once:
 
 ```ini
-# /etc/systemd/system/kinogloss.service  (plus a kinogloss.timer with OnUnitActiveSec=1h)
+# /etc/systemd/system/kinogloss-watch.service  (WantedBy=multi-user.target)
+[Service]
+User=kinogloss
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/opt/KinoGloss/kinogloss_watch.sh /media/Movies "/media/TV Shows"
+Restart=always
+RestartSec=30
+
+# /etc/systemd/system/kinogloss.service  (plus a kinogloss.timer: OnBootSec=10min, OnCalendar=weekly)
 [Service]
 Type=oneshot
 User=kinogloss
 Nice=10
 IOSchedulingClass=idle
-ExecStart=/usr/bin/python3 -I /opt/KinoGloss/bazarr_hook.py --backfill /media/Movies "/media/TV Shows" --quiet
+ExecStart=/usr/bin/flock /opt/KinoGloss/.run.lock /usr/bin/python3 -I /opt/KinoGloss/bazarr_hook.py --backfill /media/Movies "/media/TV Shows" --quiet
 ```
 
 ## Tests
