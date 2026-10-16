@@ -22,7 +22,10 @@ because it logs anything on stderr as an error.
 
 Backfill an existing library without Bazarr:
 
-    python bazarr_hook.py --backfill "E:\\Medien\\Kino" [--dry-run]
+    python bazarr_hook.py --backfill "E:\\Medien\\Kino" [more roots...] [--dry-run] [--quiet]
+
+Backfill skips outputs newer than their inputs, so it can run on a timer;
+--quiet hides those "up to date" lines.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,7 +46,8 @@ sys.path.insert(0, str(HERE))
 import kinogloss  # noqa: E402
 
 DEFAULTS = {
-    # languages you are learning: a subtitle in one of these becomes MAIN
+    # languages you are learning: a subtitle in one of these becomes MAIN;
+    # "*" means every language other than gloss_language
     "study_languages": ["ru", "pl", "sk", "sr", "hr", "sh", "lt"],
     # the language you already read: it becomes the italic GLOSS
     "gloss_language": "en",
@@ -87,6 +92,36 @@ def sidecars(video: Path, lang: str) -> list[Path]:
     order = [f"{stem}.{lang}.srt", f"{stem}.{lang}.sdh.srt", f"{stem}.{lang}.hi.srt",
              f"{stem}.{lang}.cc.srt"]
     return [video.parent / n for n in order if (video.parent / n).is_file()]
+
+
+SIDECAR_RE = re.compile(r"\.([a-z]{2,3})(?:\.(?:sdh|hi|cc))?\.srt$")
+
+
+def is_study(lang: str, cfg: dict) -> bool:
+    study = cfg["study_languages"]
+    return lang != cfg["gloss_language"] if study == "*" else lang in study
+
+
+def sidecar_langs(video: Path) -> list[str]:
+    """Languages of the non-forced SRT sidecars next to `video`."""
+    stem = video.with_suffix("").name
+    langs = set()
+    for p in video.parent.iterdir():
+        if p.name.startswith(stem + ".") and p.is_file():
+            m = SIDECAR_RE.fullmatch(p.name[len(stem):])
+            if m:
+                langs.add(m[1])
+    return sorted(langs)
+
+
+def study_langs(video: Path, cfg: dict) -> list[str]:
+    if cfg["study_languages"] == "*":
+        return [l for l in sidecar_langs(video) if l != cfg["gloss_language"]]
+    return list(cfg["study_languages"])
+
+
+def output_path(video: Path, lang: str, cfg: dict) -> Path:
+    return video.parent / cfg["output_name"].format(stem=video.with_suffix("").name, lang=lang)
 
 
 def find_ffmpeg() -> tuple[str | None, str | None]:
@@ -136,7 +171,7 @@ def ours_or_absent(path: Path, cfg: dict) -> bool:
 
 
 def gloss(video: Path, main_srt: Path, lang: str, gloss_srt: Path, cfg: dict, dry: bool = False) -> str:
-    out = video.parent / cfg["output_name"].format(stem=video.with_suffix("").name, lang=lang)
+    out = output_path(video, lang, cfg)
     if out.resolve() == main_srt.resolve():
         return f"skip {main_srt.name}: would overwrite itself"
     if not ours_or_absent(out, cfg):
@@ -160,20 +195,32 @@ def gloss(video: Path, main_srt: Path, lang: str, gloss_srt: Path, cfg: dict, dr
     return f"wrote {out.name}"
 
 
-def handle(video: Path, subtitle: Path, lang: str, cfg: dict, dry: bool = False) -> list[str]:
+def fresh(video: Path, main_srt: Path, lang: str, cfg: dict) -> bool:
+    """Our output exists and is newer than its MAIN and any English sidecar."""
+    out = output_path(video, lang, cfg)
+    if not out.exists() or not ours_or_absent(out, cfg) or cfg["overwrite_foreign_ass"]:
+        return False
+    deps = [main_srt, *sidecars(video, cfg["gloss_language"])[:1]]
+    return out.stat().st_mtime >= max(d.stat().st_mtime for d in deps)
+
+
+def handle(video: Path, subtitle: Path, lang: str, cfg: dict, dry: bool = False,
+           skip_fresh: bool = False) -> list[str]:
     lang = lang.lower()
-    study, gl = cfg["study_languages"], cfg["gloss_language"]
+    gl = cfg["gloss_language"]
     if subtitle.suffix.lower() != ".srt":
         return [f"skip {subtitle.name}: KinoGloss reads SRT only"]
     results = []
     with tempfile.TemporaryDirectory() as tmp:
-        if lang in study:
+        if is_study(lang, cfg):
+            if skip_fresh and fresh(video, subtitle, lang, cfg):
+                return [f"up to date: {output_path(video, lang, cfg).name}"]
             gloss_srt = next(iter(sidecars(video, gl)), None) or extract_embedded(video, gl, Path(tmp))
             if gloss_srt is None:
                 return [f"no {gl} subtitle for {video.name} yet; will gloss when one arrives"]
             results.append(gloss(video, subtitle, lang, gloss_srt, cfg, dry))
         elif lang == gl:
-            for other in study:
+            for other in study_langs(video, cfg):
                 for main_srt in sidecars(video, other)[:1]:
                     results.append(gloss(video, main_srt, other, subtitle, cfg, dry))
             if not results:
@@ -183,22 +230,25 @@ def handle(video: Path, subtitle: Path, lang: str, cfg: dict, dry: bool = False)
     return results
 
 
-def backfill(root: Path, cfg: dict, dry: bool) -> None:
+def backfill(root: Path, cfg: dict, dry: bool, quiet: bool = False) -> None:
     for video in sorted(p for p in root.rglob("*") if p.suffix.lower() in VIDEO_EXTS):
         if any(part.lower() in ("featurettes", "deleted scenes", "trailers", "interviews",
                                 "behind the scenes", "extras", "_torrent-extras") for part in video.parts):
             continue
-        for lang in cfg["study_languages"]:
+        for lang in study_langs(video, cfg):
             main = sidecars(video, lang)
             if main:
-                for r in handle(video, main[0], lang, cfg, dry):
-                    print(f"{video.parent.name}: {r}")
+                for r in handle(video, main[0], lang, cfg, dry, skip_fresh=True):
+                    if quiet and r.startswith("up to date"):
+                        continue
+                    print(f"{video.parent.name}: {r}", flush=True)
 
 
 def main(argv: list[str]) -> int:
     cfg = load_config()
     if argv[:1] == ["--backfill"]:
-        backfill(Path(unquote(argv[1])), cfg, dry="--dry-run" in argv)
+        for root in [a for a in argv[1:] if not a.startswith("--")]:
+            backfill(Path(unquote(root)), cfg, dry="--dry-run" in argv, quiet="--quiet" in argv)
         return 0
     if len(argv) != 3:
         print("usage: bazarr_hook.py {{episode}} {{subtitles}} {{subtitles_language_code2}}")

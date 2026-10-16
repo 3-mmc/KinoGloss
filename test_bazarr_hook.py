@@ -104,6 +104,33 @@ class HookTest(unittest.TestCase):
         fr = self.write("Film (2000).fr.srt", ENGLISH)
         self.assertIn("nothing to do", bazarr_hook.handle(self.video, fr, "fr", self.cfg)[0])
 
+    def test_star_makes_every_non_english_language_a_study_language(self):
+        self.cfg["study_languages"] = "*"
+        fr = self.write("Film (2000).fr.srt", RUSSIAN)
+        self.write("Film (2000).en.srt", ENGLISH)
+        self.assertEqual(bazarr_hook.handle(self.video, fr, "fr", self.cfg), ["wrote Film (2000).fr.ass"])
+
+    def test_star_english_arrival_glosses_every_sidecar_language(self):
+        self.cfg["study_languages"] = "*"
+        self.write("Film (2000).fr.srt", RUSSIAN)
+        self.write("Film (2000).de.sdh.srt", RUSSIAN)
+        self.write("Film (2000).es.forced.srt", RUSSIAN)  # forced: never MAIN
+        en = self.write("Film (2000).en.srt", ENGLISH)
+        result = bazarr_hook.handle(self.video, en, "en", self.cfg)
+        self.assertEqual(result, ["wrote Film (2000).de.ass", "wrote Film (2000).fr.ass"])
+
+    def test_backfill_skips_fresh_output_until_an_input_changes(self):
+        import os, time
+        ru = self.write("Film (2000).ru.srt", RUSSIAN)
+        en = self.write("Film (2000).en.srt", ENGLISH)
+        self.assertEqual(bazarr_hook.handle(self.video, ru, "ru", self.cfg, skip_fresh=True),
+                         ["wrote Film (2000).ru.ass"])
+        self.assertIn("up to date", bazarr_hook.handle(self.video, ru, "ru", self.cfg, skip_fresh=True)[0])
+        later = time.time() + 10
+        os.utime(en, (later, later))
+        self.assertEqual(bazarr_hook.handle(self.video, ru, "ru", self.cfg, skip_fresh=True),
+                         ["wrote Film (2000).ru.ass"])
+
 
 if __name__ == "__main__":
     unittest.main()
